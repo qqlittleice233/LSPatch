@@ -30,12 +30,15 @@ import org.lsposed.lspd.nativebridge.SigBypass;
 import org.lsposed.lspd.service.ILSPApplicationService;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.lang.reflect.Array;
 import java.lang.reflect.Field;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -47,6 +50,7 @@ import java.util.Map;
 import java.util.function.BiConsumer;
 import java.util.zip.ZipFile;
 
+import dalvik.system.InMemoryDexClassLoader;
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedHelpers;
 import hidden.HiddenApiBridge;
@@ -66,6 +70,9 @@ public class LSPApplication {
     private static LoadedApk appLoadedApk;
 
     private static PatchConfig config;
+
+    private static final String ASSETS_PATCH_PATH = "assets/lspatch/patch.dex";
+    private static boolean isPatchLoaded = false;
 
     public static boolean isIsolated() {
         return (android.os.Process.myUid() % PER_USER_RANGE) >= FIRST_APP_ZYGOTE_ISOLATED_UID;
@@ -327,8 +334,58 @@ public class LSPApplication {
         for (Field field : fields) {
             if (field.getType() == ClassLoader.class) {
                 var obj = XposedHelpers.getObjectField(appLoadedApk, field.getName());
+                if (obj != null) {
+                    if (!isPatchLoaded) {
+                        try {
+                            ClassLoader patchCL = getPatchClassLoader();
+                            if (patchCL == null) {
+                                Log.d(TAG, "Patch classloader is null");
+                                return;
+                            }
+                            Object cLPathList = XposedHelpers.getObjectField(patchCL, "pathList");
+                            Object cLDexElements = XposedHelpers.getObjectField(cLPathList, "dexElements");
+                            Object oLPathList = XposedHelpers.getObjectField(obj, "pathList");
+                            Object oLDexElements = XposedHelpers.getObjectField(oLPathList, "dexElements");
+                            Object newDexElements = Array.newInstance(oLDexElements.getClass().getComponentType(), Array.getLength(oLDexElements) + Array.getLength(cLDexElements));
+                            for (int i = 0; i < Array.getLength(cLDexElements); i++) {
+                                Array.set(newDexElements, i, Array.get(cLDexElements, i));
+                            }
+                            for (int i = 0; i < Array.getLength(oLDexElements); i++) {
+                                Array.set(newDexElements, Array.getLength(cLDexElements) + i, Array.get(oLDexElements, i));
+                            }
+                            XposedHelpers.setObjectField(oLPathList, "dexElements", newDexElements);
+                            patchCL = null;
+                            Log.d(TAG, "Inject patch classloader to " + field.getName());
+                            isPatchLoaded = true;
+                        } catch (Throwable e) {
+                            Log.e(TAG, "Failed to inject patch classloader", e);
+                            return;
+                        }
+                    }
+                }
                 XposedHelpers.setObjectField(stubLoadedApk, field.getName(), obj);
             }
         }
     }
+
+    private static ClassLoader getPatchClassLoader() {
+        try {
+            var is = stubLoadedApk.getClassLoader().getResourceAsStream(ASSETS_PATCH_PATH);
+            var os = new ByteArrayOutputStream();
+            if (is == null) {
+                Log.d(TAG, "No patch file found");
+                return null;
+            }
+            byte[] buffer = new byte[8192];
+            int n;
+            while (-1 != (n = is.read(buffer))) {
+                os.write(buffer, 0, n);
+            }
+            return new InMemoryDexClassLoader(ByteBuffer.wrap(os.toByteArray()), ClassLoader.getSystemClassLoader());
+        } catch (Throwable e) {
+            Log.e(TAG, "Failed to create patch ClassLoader", e);
+            return null;
+        }
+    }
+
 }
