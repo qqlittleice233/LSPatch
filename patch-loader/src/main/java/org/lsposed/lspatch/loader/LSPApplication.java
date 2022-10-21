@@ -1,6 +1,5 @@
 package org.lsposed.lspatch.loader;
 
-import static android.os.Parcelable.PARCELABLE_WRITE_RETURN_VALUE;
 import static org.lsposed.lspatch.share.Constants.CONFIG_ASSET_PATH;
 import static org.lsposed.lspatch.share.Constants.ORIGINAL_APK_ASSET_PATH;
 
@@ -9,15 +8,18 @@ import android.app.LoadedApk;
 import android.content.Context;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageInfo;
+import android.content.pm.PackageManager;
 import android.content.pm.Signature;
 import android.content.res.CompatibilityInfo;
 import android.os.Build;
-import android.os.IBinder;
 import android.os.Parcel;
+import android.os.Parcelable;
 import android.system.Os;
+import android.util.Base64;
 import android.util.Log;
 
 import com.google.gson.Gson;
+import com.google.gson.JsonSyntaxException;
 
 import org.lsposed.lspatch.loader.util.FileUtils;
 import org.lsposed.lspatch.loader.util.XLog;
@@ -46,13 +48,16 @@ import java.nio.file.Paths;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.function.BiConsumer;
 import java.util.zip.ZipFile;
 
 import dalvik.system.InMemoryDexClassLoader;
+
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedHelpers;
+
 import hidden.HiddenApiBridge;
 
 /**
@@ -70,6 +75,7 @@ public class LSPApplication {
     private static LoadedApk appLoadedApk;
 
     private static PatchConfig config;
+    private static final Map<String, String> signatures = new HashMap<>();
 
     private static final String ASSETS_PATCH_PATH = "assets/lspatch/patch.dex";
     private static boolean isPatchLoaded = false;
@@ -177,7 +183,8 @@ public class LSPApplication {
                     var mLaunchingActivities = (Map<?, ?>) XposedHelpers.getObjectField(activityThread, "mLaunchingActivities");
                     mLaunchingActivities.forEach(fixActivityClientRecord);
                 }
-            } catch (Throwable ignored) {}
+            } catch (Throwable ignored) {
+            }
             Log.i(TAG, "hooked app initialized: " + appLoadedApk);
 
             var context = (Context) XposedHelpers.callStaticMethod(Class.forName("android.app.ContextImpl"), "createAppContext", activityThread, stubLoadedApk);
@@ -250,75 +257,73 @@ public class LSPApplication {
         return field.getInt(null);
     }
 
-    private static void bypassSignature(Context context) throws ClassNotFoundException, IllegalAccessException, NoSuchFieldException {
-        final int TRANSACTION_getPackageInfo = getTranscationId("android.content.pm.IPackageManager$Stub", "TRANSACTION_getPackageInfo");
-        XposedHelpers.findAndHookMethod("android.os.BinderProxy", null, "transact", int.class, Parcel.class, Parcel.class, int.class, new XC_MethodHook() {
+    private static void proxyPackageInfoCreator(Context context) {
+        Parcelable.Creator<PackageInfo> originalCreator = PackageInfo.CREATOR;
+        Parcelable.Creator<PackageInfo> proxiedCreator = new Parcelable.Creator<>() {
             @Override
-            protected void afterHookedMethod(MethodHookParam param) throws Throwable {
-                try {
-                    Object object = param.thisObject;
-
-                    int id = (int) param.args[0];
-                    Parcel write = (Parcel) param.args[1];
-                    Parcel out = (Parcel) param.args[2];
-
-                    // forward check
-                    if (write == null || out == null) {
-                        return;
+            public PackageInfo createFromParcel(Parcel source) {
+                PackageInfo packageInfo = originalCreator.createFromParcel(source);
+                boolean hasSignature = (packageInfo.signatures != null && packageInfo.signatures.length != 0) || packageInfo.signingInfo != null;
+                if (hasSignature) {
+                    String packageName = packageInfo.packageName;
+                    String replacement = signatures.get(packageName);
+                    if (replacement == null && !signatures.containsKey(packageName)) {
+                        try {
+                            var metaData = context.getPackageManager().getApplicationInfo(packageName, PackageManager.GET_META_DATA).metaData;
+                            String encoded = null;
+                            if (metaData != null) encoded = metaData.getString("lspatch");
+                            if (encoded != null) {
+                                var json = new String(Base64.decode(encoded, Base64.DEFAULT), StandardCharsets.UTF_8);
+                                var patchConfig = new Gson().fromJson(json, PatchConfig.class);
+                                replacement = patchConfig.originalSignature;
+                            }
+                        } catch (PackageManager.NameNotFoundException | JsonSyntaxException ignored) {
+                        }
+                        signatures.put(packageName, replacement);
                     }
-
-                    // prevent recurise call
-                    if (id == IBinder.INTERFACE_TRANSACTION) {
-                        return;
-                    }
-
-                    String desc = (String) XposedHelpers.callMethod(object, "getInterfaceDescriptor");
-                    if (desc == null || desc.isEmpty() || !desc.equals("android.content.pm.IPackageManager")) {
-                        return;
-                    }
-                    if (id == TRANSACTION_getPackageInfo) {
-                        out.readException();
-                        if (0 != out.readInt()) {
-                            PackageInfo packageInfo = PackageInfo.CREATOR.createFromParcel(out);
-                            if (packageInfo.packageName.equals(context.getApplicationInfo().packageName)) {
-                                if (packageInfo.signatures != null && packageInfo.signatures.length > 0) {
-                                    XLog.d(TAG, "Replace signature info (method 1)");
-                                    packageInfo.signatures[0] = new Signature(config.originalSignature);
-                                }
-
-                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                                    if (packageInfo.signingInfo != null) {
-                                        XLog.d(TAG, "Replace signature info (method 2)");
-                                        Signature[] signaturesArray = packageInfo.signingInfo.getApkContentsSigners();
-                                        if (signaturesArray != null && signaturesArray.length > 0) {
-                                            signaturesArray[0] = new Signature(config.originalSignature);
-                                        }
-                                    }
-                                }
-
-                                out.setDataPosition(0);
-                                out.setDataSize(0);
-                                out.writeNoException();
-                                out.writeInt(1);
-                                packageInfo.writeToParcel(out, PARCELABLE_WRITE_RETURN_VALUE);
+                    if (replacement != null) {
+                        if (packageInfo.signatures != null && packageInfo.signatures.length > 0) {
+                            XLog.d(TAG, "Replace signature info for `" + packageName + "` (method 1)");
+                            packageInfo.signatures[0] = new Signature(replacement);
+                        }
+                        if (packageInfo.signingInfo != null) {
+                            XLog.d(TAG, "Replace signature info for `" + packageName + "` (method 2)");
+                            Signature[] signaturesArray = packageInfo.signingInfo.getApkContentsSigners();
+                            if (signaturesArray != null && signaturesArray.length > 0) {
+                                signaturesArray[0] = new Signature(replacement);
                             }
                         }
-
-                        // reset pos
-                        out.setDataPosition(0);
                     }
-                } catch (Throwable err) {
-                    // should not happen, just crash app
-                    throw new IllegalStateException("lsp hook error", err);
                 }
+                return packageInfo;
             }
-        });
+
+            @Override
+            public PackageInfo[] newArray(int size) {
+                return originalCreator.newArray(size);
+            }
+        };
+        XposedHelpers.setStaticObjectField(PackageInfo.class, "CREATOR", proxiedCreator);
+        try {
+            Map<?, ?> mCreators = (Map<?, ?>) XposedHelpers.getStaticObjectField(Parcel.class, "mCreators");
+            mCreators.clear();
+        } catch (NoSuchFieldError ignore) {
+        } catch (Throwable e) {
+            Log.w(TAG, "fail to clear Parcel.mCreators", e);
+        }
+        try {
+            Map<?, ?> sPairedCreators = (Map<?, ?>) XposedHelpers.getStaticObjectField(Parcel.class, "sPairedCreators");
+            sPairedCreators.clear();
+        } catch (NoSuchFieldError ignore) {
+        } catch (Throwable e) {
+            Log.w(TAG, "fail to clear Parcel.sPairedCreators", e);
+        }
     }
 
-    private static void doSigBypass(Context context) throws IllegalAccessException, ClassNotFoundException, IOException, NoSuchFieldException {
+    private static void doSigBypass(Context context) throws IOException {
         if (config.sigBypassLevel >= Constants.SIGBYPASS_LV_PM) {
             XLog.d(TAG, "Original signature: " + config.originalSignature.substring(0, 16) + "...");
-            bypassSignature(context);
+            proxyPackageInfoCreator(context);
         }
         if (config.sigBypassLevel >= Constants.SIGBYPASS_LV_PM_OPENAT) {
             String cacheApkPath;
