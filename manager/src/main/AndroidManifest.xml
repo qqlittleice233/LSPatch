@@ -7,6 +7,7 @@
         android:name="android.permission.QUERY_ALL_PACKAGES"
         tools:ignore="QueryAllPackagesPermission" />
     <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
 
     <application
         android:name=".LSPApplication"
@@ -26,12 +27,9 @@
             </intent-filter>
         </activity>
 
-        <provider
-            android:name=".manager.ModuleProvider"
-            android:authorities="org.lsposed.lspatch.provider"
-            android:enabled="true"
-            android:exported="true"
-            tools:ignore="ExportedContentProvider" />
+        <service
+            android:name=".manager.ModuleService"
+            android:exported="true" />
 
         <provider
             android:name="rikka.shizuku.ShizukuProvider"
